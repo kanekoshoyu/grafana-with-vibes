@@ -44,12 +44,18 @@ grafana_get() {
 grafana_post() {
   local path="$1"
   local body="$2"
+  local tmpfile
+  tmpfile=$(mktemp)
+  echo "$body" > "$tmpfile"
   curl -sSf \
     -X POST \
     -H "Authorization: Bearer $GRAFANA_TOKEN" \
     -H "Content-Type: application/json" \
-    -d "$body" \
+    -d "@$tmpfile" \
     "$GRAFANA_URL$path"
+  local rc=$?
+  rm -f "$tmpfile"
+  return $rc
 }
 
 safe_filename() {
@@ -62,11 +68,12 @@ safe_filename() {
 # ──────────────────────────────────────────────
 
 cmd_init() {
-  local url="" token=""
+  local url="" token="" db_url=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --url)   url="$2";   shift 2 ;;
-      --token) token="$2"; shift 2 ;;
+      --url)    url="$2";    shift 2 ;;
+      --token)  token="$2";  shift 2 ;;
+      --db-url) db_url="$2"; shift 2 ;;
       *) echo "error: unknown option: $1" >&2; exit 1 ;;
     esac
   done
@@ -77,10 +84,11 @@ cmd_init() {
   # Strip trailing slash
   url="${url%/}"
 
-  cat > "$ENV_FILE" <<EOF
-GRAFANA_URL=$url
-GRAFANA_TOKEN=$token
-EOF
+  {
+    echo "GRAFANA_URL=$url"
+    echo "GRAFANA_TOKEN=$token"
+    [[ -n "$db_url" ]] && echo "DB_URL=$db_url"
+  } > "$ENV_FILE"
 
   echo "saved to .env"
 
@@ -242,6 +250,196 @@ print(json.dumps(payload))
   fi
 }
 
+cmd_query() {
+  load_env
+
+  local from_date="" to_date="" limit=1000 sql="" vars_str=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)  from_date="$2"; shift 2 ;;
+      --to)    to_date="$2";   shift 2 ;;
+      --var)   [[ -n "$vars_str" ]] && vars_str="$vars_str|$2" || vars_str="$2"; shift 2 ;;
+      --limit) limit="$2";     shift 2 ;;
+      -*) echo "error: unknown option: $1" >&2; exit 1 ;;
+      *)  sql="$1"; shift ;;
+    esac
+  done
+
+  # Accept SQL from stdin if not given as argument
+  [[ -z "$sql" ]] && sql=$(cat)
+  [[ -z "$sql" ]] && { echo "error: provide SQL as argument or via stdin" >&2; exit 1; }
+
+  [[ -z "${DB_URL:-}" ]] && {
+    echo "error: DB_URL not set. Add to .env: DB_URL=http://mydb:9000/exec" >&2
+    exit 1
+  }
+
+  local sqltmp
+  sqltmp=$(mktemp)
+  printf '%s' "$sql" > "$sqltmp"
+
+  DB_URL="$DB_URL" \
+  GWV_FROM="$from_date" \
+  GWV_TO="$to_date" \
+  GWV_LIMIT="$limit" \
+  GWV_SQLTMP="$sqltmp" \
+  GWV_VARS="$vars_str" \
+  python3 << 'PYEOF'
+import os, sys, urllib.parse, urllib.request, json
+from datetime import datetime, timezone, timedelta
+
+db_url    = os.environ['DB_URL'].rstrip('/')
+from_date = os.environ.get('GWV_FROM', '')
+to_date   = os.environ.get('GWV_TO', '')
+limit     = int(os.environ.get('GWV_LIMIT', 1000))
+sqltmp    = os.environ['GWV_SQLTMP']
+vars_raw  = os.environ.get('GWV_VARS', '')
+
+with open(sqltmp) as f:
+    sql = f.read().strip()
+
+# Date string → Unix milliseconds
+def to_ms(s, end=False):
+    if not s:
+        now = datetime.now(timezone.utc)
+        return int((now if end else now - timedelta(hours=24)).timestamp() * 1000)
+    for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d'):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    raise ValueError(f"unrecognised date: {s}")
+
+from_ms = to_ms(from_date)
+to_ms_v = to_ms(to_date, end=True)
+
+# Substitute Grafana time macros
+sql = sql.replace('$__from', str(from_ms)).replace('$__to', str(to_ms_v))
+
+# Substitute ${VAR} from --var KEY=VALUE pairs
+if vars_raw:
+    for pair in vars_raw.split('|'):
+        k, _, v = pair.partition('=')
+        sql = sql.replace(f'${{{k.strip()}}}', v.strip())
+
+# Execute against HTTP database endpoint
+url = f"{db_url}?limit={limit}&query=" + urllib.parse.quote(sql)
+req = urllib.request.Request(url)
+try:
+    with urllib.request.urlopen(req, timeout=120) as r:
+        d = json.loads(r.read())
+except urllib.error.HTTPError as e:
+    body = e.read().decode()
+    d = json.loads(body) if body.startswith('{') else {'error': body}
+
+if 'error' in d:
+    pos = f" (position {d['position']})" if 'position' in d else ''
+    print(f"error: {d['error']}{pos}", file=sys.stderr)
+    sys.exit(1)
+
+cols = [c['name'] for c in d.get('columns', [])]
+rows = d.get('dataset', [])
+count = d.get('count', len(rows))
+
+if not rows:
+    print('0 rows returned')
+    sys.exit(0)
+
+# Pretty-print as aligned table
+str_rows = [[str(v) for v in row] for row in rows]
+widths = [max(len(c), max(len(r[i]) for r in str_rows)) for i, c in enumerate(cols)]
+fmt = '  '.join(f'{{:<{w}}}' for w in widths)
+sep = '  '.join('─' * w for w in widths)
+print(fmt.format(*cols))
+print(sep)
+for row in str_rows:
+    print(fmt.format(*row))
+print(f'\n{count} row(s)  [from {from_date or "24h ago"} → {to_date or "now"}]')
+PYEOF
+  local rc=$?
+  rm -f "$sqltmp"
+  return $rc
+}
+
+cmd_panel() {
+  local file="" panel_id="" panel_title="" sql_only=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --id)    panel_id="$2";    shift 2 ;;
+      --title) panel_title="$2"; shift 2 ;;
+      --sql)   sql_only=true;    shift ;;
+      -*) echo "error: unknown option: $1" >&2; exit 1 ;;
+      *)  file="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$file" ]]  && { echo "error: provide a dashboard file" >&2; exit 1; }
+  [[ -f "$file" ]]  || { echo "error: file not found: $file" >&2; exit 1; }
+
+  GWV_FILE="$file" \
+  GWV_ID="$panel_id" \
+  GWV_TITLE="$panel_title" \
+  GWV_SQL_ONLY="$sql_only" \
+  python3 << 'PYEOF'
+import os, json, sys
+
+file     = os.environ['GWV_FILE']
+pid      = os.environ.get('GWV_ID', '')
+title    = os.environ.get('GWV_TITLE', '').lower()
+sql_only = os.environ.get('GWV_SQL_ONLY') == 'true'
+
+with open(file) as f:
+    data = json.load(f)
+
+def flatten(panels):
+    out = []
+    for p in panels:
+        out.append(p)
+        if 'panels' in p:
+            out.extend(flatten(p['panels']))
+    return out
+
+all_panels = flatten(data['dashboard']['panels'])
+
+# No filter → list all panels
+if not pid and not title:
+    print(f"{'ID':>4}  {'TYPE':<12}  {'TITLE'}")
+    print(f"{'─'*4}  {'─'*12}  {'─'*55}")
+    for p in all_panels:
+        has_sql = any(t.get('rawSql') for t in p.get('targets', []))
+        marker = ' *' if has_sql else ''
+        print(f"{p.get('id','?'):>4}  {p.get('type',''):.<12}  {p.get('title','')[:55]}{marker}")
+    print('\n* panel has a SQL query')
+    sys.exit(0)
+
+# Find matches
+if pid:
+    matches = [p for p in all_panels if str(p.get('id')) == pid]
+else:
+    matches = [p for p in all_panels if title in p.get('title', '').lower()]
+
+if not matches:
+    print('error: no panel found', file=sys.stderr)
+    sys.exit(1)
+
+for p in matches:
+    if sql_only:
+        for t in p.get('targets', []):
+            if t.get('rawSql'):
+                print(t['rawSql'])
+    else:
+        print(f"ID {p['id']}  |  {p['title']}")
+        print(f"type: {p.get('type')}  gridPos: {p.get('gridPos')}")
+        for i, t in enumerate(p.get('targets', [])):
+            if t.get('rawSql'):
+                print(f"\n─── target {i} ───")
+                print(t['rawSql'])
+PYEOF
+}
+
 cmd_help() {
   cat <<'EOF'
 grafana_with_vibes — manage Grafana dashboards as local JSON
@@ -250,10 +448,10 @@ USAGE
   ./grafana_with_vibes <command> [options]
 
 COMMANDS
-  init   --url <grafana-url> --token <api-token>
+  init   --url <grafana-url> --token <api-token> [--db-url <endpoint>]
            Save connection config to .env and verify connectivity.
-           Generate a service account token in Grafana:
-           Administration → Service accounts → Add service account token
+           --db-url is optional; only needed if you use the query command.
+           Example: --db-url http://mydb:9000/exec
 
   list   List all dashboards in Grafana with their UIDs.
 
@@ -263,12 +461,33 @@ COMMANDS
   push   <file>        Push a local dashboard JSON back to Grafana.
          --no-overwrite  Create as new instead of overwriting.
 
+  query  [--from DATE] [--to DATE] [--var KEY=VAL] [--limit N] "<sql>"
+           Run SQL against an HTTP database and print results as a table.
+           DATE format: 2025-08-01 or 2025-08-01T12:00:00
+           Substitutes $__from, $__to, ${VAR} automatically.
+           Requires DB_URL in .env (set via init --db-url or manually).
+
+  panel  <file> [--id N] [--title PATTERN] [--sql]
+           Inspect panels in a dashboard file.
+           No filter: list all panels.
+           --sql: print only the raw SQL (pipeable to query).
+
 WORKFLOW
   ./grafana_with_vibes init --url http://grafana:3000 --token glsa_xxx
   ./grafana_with_vibes list
   ./grafana_with_vibes pull --uid abc123def
   # edit dashboards/my-dashboard__abc123def.json
   ./grafana_with_vibes push dashboards/my-dashboard__abc123def.json
+
+QUERY WORKFLOW
+  # Test a panel's SQL before pushing:
+  ./grafana_with_vibes panel dashboards/my-dashboard__abc123.json --id 48 --sql \
+    | ./grafana_with_vibes query --from 2025-08-01 --to 2025-08-10 \
+        --var ENTRY_THR=0.001 --var EXIT_THR=0.0005 --var VOLUME_THR=1
+
+  # Quick ad-hoc query:
+  ./grafana_with_vibes query --from 2025-08-01 --to 2025-08-02 \
+    "SELECT count(*) FROM hyperliquid_fill_1m_aggregate"
 
 EOF
 }
@@ -285,6 +504,8 @@ case "$command" in
   list)  cmd_list  "$@" ;;
   pull)  cmd_pull  "$@" ;;
   push)  cmd_push  "$@" ;;
+  query) cmd_query "$@" ;;
+  panel) cmd_panel "$@" ;;
   help|--help|-h) cmd_help ;;
   *) echo "error: unknown command: $command" >&2; cmd_help; exit 1 ;;
 esac

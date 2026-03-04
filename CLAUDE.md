@@ -72,6 +72,32 @@ Token variable: `'${TOKEN}'` — used in `WHERE coin = '${TOKEN}'`.
 
 Datasource uid: `bf3a9i7tmeio0d` (type: `questdb-questdb-datasource`).
 
+## Testing queries before pushing
+
+**Always test SQL changes against QuestDB before pushing.** Use the HTTP API:
+
+```python
+import urllib.parse, urllib.request, json
+from datetime import datetime, timezone
+
+# Pick a range with known data (liq data: 2025-07-28 to 2026-01-31)
+from_ms = int(datetime(2025, 8, 1, tzinfo=timezone.utc).timestamp() * 1000)
+to_ms   = int(datetime(2025, 8, 10, tzinfo=timezone.utc).timestamp() * 1000)
+
+sql = "...your query with $__from/$__to replaced by {f}/{t}...".format(
+    f=from_ms*1000, t=to_ms*1000  # QuestDB uses microseconds
+)
+url = "http://questdb.bounteer.com:9000/exec?query=" + urllib.parse.quote(sql)
+with urllib.request.urlopen(url, timeout=120) as r:
+    d = json.loads(r.read())
+    if 'error' in d:
+        print("ERROR:", d['error'])
+    else:
+        print(f"OK — {d['count']} rows:", d['dataset'][:5])
+```
+
+Key dates with liq event data: 2025-08-02 (VINE/PENGU stress events), 2025-08-09 (MOODENG). Use `volume_threshold=1` in tests to bypass volume filter.
+
 ## Pushing changes
 
 ```bash
