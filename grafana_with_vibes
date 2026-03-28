@@ -194,13 +194,111 @@ print(json.dumps(out, indent=2))
   echo "pulled: $title  →  dashboards/$(basename "$filename")"
 }
 
+_dashboard_hash() {
+  # Compute a content hash of the dashboard object (excluding version/id metadata)
+  python3 -c "
+import json, sys, hashlib
+data = json.load(sys.stdin)
+db = dict(data.get('dashboard', data))
+# Remove fields that change on every save
+for k in ('version', 'id'):
+    db.pop(k, None)
+h = hashlib.sha256(json.dumps(db, sort_keys=True).encode()).hexdigest()[:16]
+print(h)
+"
+}
+
+cmd_check() {
+  require_env
+
+  local file=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -*) echo "error: unknown option: $1" >&2; exit 1 ;;
+      *)  file="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$file" ]] && { echo "error: provide a dashboard file" >&2; exit 1; }
+  [[ -f "$file" ]] || { echo "error: file not found: $file" >&2; exit 1; }
+
+  _check_remote "$file"
+}
+
+# Returns 0 if ok, 1 if mismatch. Prints warnings to stderr.
+_check_remote() {
+  local file="$1"
+
+  local local_uid local_title local_version local_hash
+  read -r local_uid local_version <<< "$(python3 -c "
+import json
+d = json.load(open('$file'))['dashboard']
+print(d.get('uid',''), d.get('version',''))
+")"
+  local_title=$(python3 -c "import json; print(json.load(open('$file'))['dashboard']['title'])")
+  local_hash=$(cat "$file" | _dashboard_hash)
+
+  if [[ -z "$local_uid" ]]; then
+    echo "warning: no UID in local file, skipping remote check" >&2
+    return 0
+  fi
+
+  local remote_raw
+  remote_raw=$(grafana_get "/api/dashboards/uid/$local_uid" 2>/dev/null) || {
+    echo "warning: could not fetch remote dashboard (uid=$local_uid), skipping check" >&2
+    return 0
+  }
+
+  local remote_title remote_version remote_hash
+  remote_title=$(echo "$remote_raw" | python3 -c "import sys,json; print(json.load(sys.stdin)['dashboard']['title'])")
+  remote_version=$(echo "$remote_raw" | python3 -c "import sys,json; print(json.load(sys.stdin)['dashboard'].get('version',''))")
+  remote_hash=$(echo "$remote_raw" | python3 -c "
+import sys,json
+data = json.load(sys.stdin)
+out = {'dashboard': data['dashboard']}
+print(json.dumps(out))
+" | _dashboard_hash)
+
+  local issues=0
+
+  if [[ "$local_title" != "$remote_title" ]]; then
+    echo "MISMATCH: title differs" >&2
+    echo "  local:  $local_title" >&2
+    echo "  remote: $remote_title" >&2
+    (( issues++ ))
+  fi
+
+  if [[ -n "$local_version" && -n "$remote_version" && "$local_version" != "$remote_version" ]]; then
+    echo "MISMATCH: version differs (remote was edited since last pull)" >&2
+    echo "  local:  v$local_version" >&2
+    echo "  remote: v$remote_version" >&2
+    (( issues++ ))
+  fi
+
+  if [[ "$local_hash" != "$remote_hash" ]]; then
+    echo "MISMATCH: content hash differs" >&2
+    echo "  local:  $local_hash" >&2
+    echo "  remote: $remote_hash" >&2
+    (( issues++ ))
+  fi
+
+  if (( issues > 0 )); then
+    echo "found $issues difference(s) between local and remote (uid=$local_uid)" >&2
+    return 1
+  fi
+
+  echo "ok: local and remote match (uid=$local_uid, v$local_version, hash=$local_hash)"
+  return 0
+}
+
 cmd_push() {
   require_env
 
-  local file="" overwrite=true
+  local file="" overwrite=true force=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --no-overwrite) overwrite=false; shift ;;
+      --force) force=true; shift ;;
       -*) echo "error: unknown option: $1" >&2; exit 1 ;;
       *)  file="$1"; shift ;;
     esac
@@ -213,6 +311,14 @@ cmd_push() {
   fi
 
   [[ -f "$file" ]] || { echo "error: file not found: $file" >&2; exit 1; }
+
+  # Check local vs remote before pushing
+  if ! $force; then
+    if ! _check_remote "$file"; then
+      echo "push aborted. use --force to push anyway, or pull first to sync." >&2
+      exit 1
+    fi
+  fi
 
   local title
   title=$(python3 -c "import json; d=json.load(open('$file')); print(d['dashboard']['title'])")
@@ -504,6 +610,7 @@ case "$command" in
   list)  cmd_list  "$@" ;;
   pull)  cmd_pull  "$@" ;;
   push)  cmd_push  "$@" ;;
+  check) cmd_check "$@" ;;
   query) cmd_query "$@" ;;
   panel) cmd_panel "$@" ;;
   help|--help|-h) cmd_help ;;
